@@ -30,6 +30,9 @@ There are some general library requirements for the project, which are as follow
 - RColorBrewer
 - doParallel
 
+## File Information
+
+__pipeline.rmd__ includes all of the related codes.
 
 
 
