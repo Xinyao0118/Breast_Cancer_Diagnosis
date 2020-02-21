@@ -1,0 +1,477 @@
+---
+title: "pipeline"
+author: "Soohyun Kim, Xinyao Wu, Yuxin Yang"
+date: "5/01/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(knitr)
+require(survival)
+require(quantreg)
+require(glmnet)
+require(caret)
+require(MASS)
+require(pROC)
+require(readr)
+require(GGally)
+require(corrplot)
+require(magrittr)
+require(dplyr)
+require(purrr)
+require(doParallel)
+require(RColorBrewer)
+set.seed(2019)
+```
+
+
+# Breast Cancer Diagnosis
+
+## Data Preprocessing
+
+```{r data preparation, warning=FALSE, message=FALSE}
+dat.original <- read_csv("./data/breastcancer.csv")
+dat <- dat.original %>% 
+  select(-c(id,X33))
+
+dat$diagnosis <- ifelse(dat$diagnosis == "M", 1, 0)
+
+#summary(dat)
+
+```
+
+Notice that the ranges of the features vary greatly. Here, we normalize the data so that features with different scales do not dominate over others and so we can compare the features. 
+
+```{r normalization}
+
+# x is a feature variable
+normalize <- function(x) {
+  return((x - mean(x)) / sd(x))
+}
+
+# normalize all features
+dat.norm <- as.data.frame(lapply(dat[,2:31], normalize))
+dat.norm <- cbind(dat$diagnosis, dat.norm)
+names(dat.norm)[1] <- "diagnosis"
+
+#summary(dat.norm)
+
+```
+
+Now, with the normalized data, we will drop features that show high correlation, with cutoff 0.85. Doing so will not affect results. 
+
+```{r correlation}
+
+corr <- cor(dat.norm) 
+# identify highly correlated covariates
+highCorr <- findCorrelation(corr, cutoff = 0.85, exact = TRUE) 
+highCorr.names <- findCorrelation(corr, cutoff = 0.85, exact = TRUE,  names = TRUE) 
+# remove one of two highly correlated features
+dat.norm.use <- dat.norm[,-c(highCorr)]
+
+p.mat <- cor.mtest(corr)$p 
+corrplot(corr, method="circle", 
+         order = "hclust", 
+         type = "upper",
+         p.mat = p.mat, 
+         sig.level = 0.05, 
+         insig = "blank",
+         diag = FALSE,
+         col = brewer.pal(n = 10, name = "RdYlBu"))
+
+```
+
+The features dropped from analysis (high correlation cutoff = 0.85) are: `r highCorr.names`. There are now 17 features after feature selection.
+
+## Full Logistic Model
+
+A logistic regression model with all variables does not converge. Furthermore, we have seen from the correlation plot that multicollinearity exists between many of the covariates. We fit a "full" logistic model using the remaining 17 variables after feature selection based on a between-features correlation threshold of 0.85. 
+
+
+```{r full model, warning=FALSE}
+
+# Split the data into training and test set
+training.samples <- dat.norm.use$diagnosis %>% 
+  createDataPartition(p = 0.8, list = FALSE)
+dat.train  <- dat.norm.use[training.samples, ]
+dat.test <- dat.norm.use[-training.samples, ]
+
+# Fit "full" model 
+full.model <- glm(diagnosis ~ .,
+                   data = dat.train, family = "binomial")
+
+full.coef <- knitr::kable(full.model$coef); full.coef
+
+
+# Make predictions
+prob <- full.model %>% predict(newdata = dat.test, type = "response")
+pred.classes <- ifelse(prob > 0.5, "M", "B")
+
+# Model accuracy
+n = length(dat.test$diagnosis)
+obs.classes <- ifelse(dat.test$diagnosis == 1, "M", "B")
+mean(pred.classes == obs.classes) ## prediction accuracy
+RSE1 = mean((prob - dat.test$diagnosis)^2)
+aRSE1 = RSE1*n/(n-2*length(full.model$coef))
+```
+
+## Full Model: Likelihood, Gradient, Hessian
+
+Due to the multicollinearity of the dataset, we chose 18 predictors out of 30 predictors to build the full model. The logistic model of malignant cancer is 
+
+$$P(Y_i = 1 | X_i = x_i) = \frac{exp(\beta_0 + X_i^T\beta)}{1+exp(\beta_0 + X_i^T\beta)}$$
+
+For our model, the likelihood function $L(\beta_0, \beta; Y)$ is 
+
+$$L(\beta) = \prod_{i=1}^{n}p(x_i)^{y_i}(1-p(x_i))^{1-y_i}$$ 
+
+
+For our model, the log-likelihood function $l(\beta_0, \beta; Y)$ is
+
+$$l(\beta_0, \beta) = \sum_{i=1}^{n}[Y_i(\beta_0 + X_i^T\beta) - log(1+exp(\beta_0 + X_i^T\beta))]$$
+We get gradient and Hessian from the log-likelihood of of our logistic regression model
+ 
+
+
+```{r hessian}
+
+hess <- function(x, p){
+  hess = matrix(0, ncol(x), ncol(x))
+  for (i in 1:nrow(x)){
+    a <- x[i,] %*% t(x[i,]) * p[i] *(1 - p[i])
+    hess <- hess +a
+  }
+  return(-hess)
+}
+
+```
+
+## Newton Raphson
+
+
+```{r logisticstuff}
+
+logisticstuff <- function(x,y, betavec){
+  u <- x %*% betavec
+  expu <- exp(u)
+  ## create loglike for large p
+  loglik <- vector(nrow(x), mode = "numeric")
+  for(i in 1:nrow(x))
+    loglik[i] <- y[i]*u[i] - log(1+expu[i])
+  ## log-likelihood at betavec
+  loglik <- sum(loglik)
+  p <- expu / (1+expu)
+  ## P(Y_i = 1 | x_i)
+  grad <- vector(length(betavec), mode = "numeric")
+  ## gradient at betavec
+  for(i in 1:18)
+    grad[i] <- sum(t(x[,i]) %*% (y - p))
+  ## function for hess due to large p value
+  Hess <- hess(x , p)
+  return(list(loglik = loglik, grad = grad, Hess = Hess))
+}
+
+```
+
+```{r newton method}
+
+NewtonRaphson <- function(x, y, func, start, maxiter = 15, tol = 1e-5) {
+  i <- 0
+  cur <- start
+  stuff<- func(x,y, cur)
+  res <- c(0, cur)
+  prevloglik <- -Inf
+  while(i < maxiter && abs(stuff$loglik - prevloglik) > tol){
+    i <- i+1
+    prevloglik <- stuff$loglik
+    prev <- cur
+    cur <- prev - solve(stuff$Hess) %*% stuff$grad
+    stuff <- func(x,y, cur)
+    res <- rbind(res,c(i,cur))
+  }
+  return(res)
+}
+
+```
+
+```{r run newton}
+
+## find parameter with possible data
+beta = rep(0.001, 18)
+Y = as.vector(dat.train$diagnosis)
+intercept = rep(1,nrow(dat.train))
+X = dat.train[,2:18] %>%
+  cbind(intercept,.) %>%
+  as.matrix()
+newton = NewtonRaphson(X,Y,
+                       logisticstuff,
+                       beta,
+                       maxiter = 15)
+
+param.estimates <- tail(as.matrix(newton[,-1]),1) # these match with glm results
+param.estimates
+```
+
+
+## Logistic-LASSO, Coordinate-Wise Update
+
+```{r functions}
+
+Y = as.vector(dat.train$diagnosis)
+X = dat.train[,-1] %>% as.matrix() 
+
+
+# functions updating objective function
+  ## probability evalutated at current parameters
+  func.cur.p <- function(beta0, beta, x){
+    intercept = rep(1,nrow(x))
+    u <-  intercept * beta0 + x %*% beta
+    expu <- exp(u)
+    p <- expu / (1 + expu)
+    return(list(u = u, expu = expu, p = p))
+  }
+  
+  ## working weights
+  func.weights <- function(p){
+    w <- p*(1-p)
+    return(w)
+  }
+  
+  ## working response
+  func.resp <- function(u, y, p){
+    z <- u + ((y - p)/(p*(1-p)))
+    return(z)
+  }
+  
+  ## objective function: penalized weighted least-squares
+
+  func.obj <- function(u, x, w, z, lambda, beta){
+    l_Q <- ((1/2)*nrow(x)*sum(t(w)%*%(z - u)^2)) + lambda*sum(abs(beta))
+
+    return(l_Q)
+  }
+
+# functions for updating parameters using coordinate descent alg.
+  ## soft-threshold function
+  
+  func.soft <- function(beta, gamma){
+    
+    beta.lasso <- as.numeric()
+    
+    if (beta > 0 && gamma < abs(beta)){
+      beta.lasso <- beta - gamma
+    }
+    else if (beta < 0 && gamma < abs(beta)){
+      beta.lasso <- beta + gamma
+    }
+    else{
+      beta.lasso <- 0
+    }
+    return(beta.lasso)
+  }
+  
+```
+
+
+```{r logistic lasso CD}
+
+# x: variables matrix (does not include vector of 1's for intercept)
+# y: binary response variable (malignant vs. benign)
+# beta: starting values of beta parameters
+# lambda: penalty on l1 regularization
+
+func.logLasso.cd <- function(x, y, beta, lambda, tol = 10e-6, maxiter = 1000){
+  
+  # Initialize parameters
+  beta0 <- 1/length(y) * sum(y - x %*% beta)
+  
+  cur.p <- func.cur.p(beta0 = beta0, beta = beta, x = x) 
+  cur.w <- func.weights(p = cur.p$p)
+  cur.z <- func.resp(u = cur.p$u,
+                       y = y,
+                       p = cur.p$p)
+  
+  # Quadratic approx. of loglik at starting beta values
+  l_Q <- func.obj(u = cur.p$u, 
+                    x = x,
+                    w = cur.w,
+                    z = cur.z,
+                    lambda = lambda,
+                    beta = beta)
+  i <- 0 
+  track.param <- c(iter = 0, l_Q, beta0,beta)
+  
+  # Updating parameters 
+  while (i < maxiter && l_Q > tol) {
+    
+    i = i + 1
+    
+    for (j in 1:length(beta)) {
+    
+      # Run coordinate descent algorithm on penalized weighted-LS to update betas
+      r <- y - (x %*% beta) # current residual
+      y.diff <- r + (x[,j] * beta[j])
+      weighted.beta <- sum(cur.w * x[,j] * y.diff)
+      # update betas
+      beta[j] <- func.soft(beta = weighted.beta, gamma = lambda)/ sum(cur.w * x[,j]^2)
+    }
+    
+    track.param <- rbind(track.param, c(iter = i, l_Q, beta0, beta))
+    
+    # Update quadratic approx. of loglik using updated parameters
+    beta0 <- mean(y) - sum(colMeans(x) * beta)
+    cur.p <- func.cur.p(beta0 = beta0, beta = beta, x = x) 
+    cur.w <- func.weights(p = cur.p$p)
+    cur.z <- func.resp(u = cur.p$u,
+                       y = y,
+                       p = cur.p$p)
+    l_Q <- func.obj(u = cur.p$u, 
+                    x = X,
+                    w = cur.w,
+                    z = cur.z,
+                    lambda = lambda,
+                    beta = beta)
+    
+     
+  }
+  
+  track.param <- as.data.frame(track.param)
+  names(track.param) <- c("iter", "approx_loglik", "intercept", colnames(X))
+  
+  final.coef <- tail(track.param[,-c(1:2)], 1)
+  return(final.coef)
+}
+
+# Try lambda = e^(1/2)
+#func.logLasso.cd(x = X, y = Y, beta = rep(0, ncol(X)), exp(.5))
+
+
+```
+
+
+```{r lambda grid}
+
+grid.lambda <- exp(seq(from = 5, to = -5, by = -0.25))
+
+res <- func.logLasso.cd(x = X, y = Y, beta = rep(0, ncol(X)), grid.lambda[1])
+
+for (i in 2:length(grid.lambda)) {
+  res <- rbind(res,
+               c(func.logLasso.cd(x = X, y = Y, beta = rep(0, ncol(X)), grid.lambda[i])))
+}
+
+res <- as.data.frame(cbind(grid.lambda, res))
+row.names(res) = 1:41
+```
+
+
+## 5-Fold Cross-Validation
+
+```{r new_5-fold}
+# Use 5-fold cross-validation on training data to find optimal lambda
+Y.train = dat.train$diagnosis
+X.train = dat.train[,-1] %>% as.matrix()
+K = 5
+index= sample(rep(1:K, len = nrow(dat.train)))
+
+result = NULL
+for(i in 1:5) {
+  x = X.train[-which(index ==i),]
+  y = Y.train[-which(index ==i)]
+  for (t in 1:41) {
+     c<-res[t,-1:-3] 
+     inds<-which(c!=0)
+     pre.x = cbind(rep(1,nrow(x)),x)
+     pre.x = pre.x[,inds]
+     coef = c[,inds]  %>% as.matrix() %>% t()
+     Y.pred = pre.x%*%coef %>% exp()
+     Y.pred = Y.pred/(1+Y.pred)
+     pred <- ifelse(Y.pred > 0.5, "M", "B")
+     # Model accuracy
+     obs <- ifelse(y == 1, "M", "B")
+     ##the optimal model prediction accuracy
+     opt.acc = mean(pred == obs)
+     
+     result = rbind(result,c(i,t,opt.acc))
+  }
+}
+result = as.data.frame(result)
+colnames(result) = c("i","lambda_combination","accurancy")
+mean_accurancy = result %>% group_by(lambda_combination) %>% summarise(mean_accurancy = mean(accurancy)) 
+ knitr::kable(mean_accurancy) %>% tail()
+#The coefficient with highest model accurancy is :
+ res[41,-1:-3] %>% knitr::kable()
+```
+
+The accurancy is so low that we try to use another way to choose the best lambda.
+```{r 5-fold cv}
+
+# Use 5-fold cross-validation on training data to find optimal lambda
+Y.train = as.vector(dat.train$diagnosis)
+#intercept.train = rep(1,nrow(dat.train))
+X.train = dat.train[,-1] %>% as.matrix() 
+
+
+registerDoParallel(cores=8)
+D.cvfit = cv.glmnet(X.train, Y.train, family = "binomial", nfolds = 5,type.measure = "deviance", parallel=TRUE)
+Mse.cvfit = cv.glmnet(X.train, Y.train, family = "binomial", nfolds = 5,type.measure = "mse", parallel=TRUE)
+Mae.cvfit = cv.glmnet(X.train, Y.train, family = "binomial", nfolds = 5,type.measure = "mae", parallel=TRUE)
+Mis.cvfit = cv.glmnet(X.train, Y.train, family = "binomial", nfolds = 5,type.measure = "class", parallel=TRUE)
+ROC.cvfit = cv.glmnet(X.train, Y.train, family = "binomial", nfolds = 5,type.measure = "auc", parallel=TRUE)
+stopImplicitCluster()
+
+#Plot
+par(mfrow = c(2,3)) 
+plot(D.cvfit)
+plot(Mse.cvfit)
+plot(Mae.cvfit)
+plot(Mis.cvfit)
+plot(ROC.cvfit)
+```
+
+Using the misclassification error rate, the best lambda is `r Mis.cvfit$lambda.min`.
+
+```{r best_lambda}
+
+opt.lambda <- Mis.cvfit$lambda.min
+c<-coef(Mis.cvfit,s='lambda.min',exact=TRUE)
+inds<-which(c!=0)
+c[inds,] %>% knitr::kable(caption = "Optimal model coefficiants")
+
+#check the average cross-validated mean squared error when using the one standard error 
+#Mis.cvfit$cvm[which(Mis.cvfit$lambda==Mis.cvfit$lambda.min)]
+
+```
+
+# Compare the prediction performance of full model and optimal model
+
+
+```{r prediction_performance}
+
+# Prediction performance done on test data 
+Y.test = dat.test$diagnosis
+X.test = dat.test[,-1]  %>% as.matrix() 
+
+# Fit "optimal" model 
+opt.model.lasso <- func.logLasso.cd(x = X.test, y = Y.test, beta = rep(0, ncol(X.test)), opt.lambda)
+X.test = cbind(rep(1,113),X.test)
+X.test = X.test[,inds]
+
+coef = c[inds,] %>% as.vector()
+Y.pred = X.test%*%coef %>% exp()
+Y.pred = Y.pred/(1+Y.pred)
+pred <- ifelse(Y.pred > 0.5, "M", "B")
+# Model accuracy
+obs <- ifelse(dat.test$diagnosis == 1, "M", "B")
+##the optimal model prediction accuracy
+ mean(pred == obs)
+ RSE2 = mean((Y.pred - Y.test)^2)
+aRSE2 = RSE2*n/(n-2*15)
+performance = data.frame(c(1-mean(pred.classes == obs.classes),1-mean(pred == obs)),c(RSE1,RSE2),c(aRSE1,aRSE2),c(mean(pred.classes == obs.classes), mean(pred == obs)))
+colnames(performance) = c("Misclassification Rate","RSE","aRSE","model accurancy")
+rownames(performance) = c("Full model","Optimal model")
+knitr::kable(performance)
+
+```
+
