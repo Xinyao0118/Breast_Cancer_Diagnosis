@@ -3,7 +3,7 @@ Compare the performance of full logistic-lasso, Newton Raphson method model and 
 
 ## Update
 
-This is a course group project and I do not have the copyroght of the data. This project is mainly about using R to build three different models, the key point is features selection. By the way, I am in charge of the Cross-validation part
+This is a course group project and I do not have the copyright of the data. This project is mainly about using R to build three different models, the key point is features selection. By the way, I am in charge of the Cross-validation part
 
 ## Dataset Information
 
