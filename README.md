@@ -1,9 +1,6 @@
 # Breast_Cancer_Diagnosis
 Compare the performance of full logistic-lasso, Newton Raphson method model and optimal Logistic-LASSO with Coordinate-Wise Update
 
-## Update
-
-This is a course group project and I do not have the copyright of the data. This project is mainly about using R to build three different models, the key point is features selection. By the way, I am in charge of the Cross-validation part
 
 ## Dataset Information
 
